@@ -59,6 +59,13 @@ class TurtleBotController:
 
         self.student_controller = StudentController()
 
+        # Below is for Keyboard controls
+        # ↓↓↓ ADD THESE 3 LINES ↓↓↓
+        self.keyboard = self.robot.getKeyboard()
+        self.keyboard.enable(self.time_step)
+        self.student_controller.set_keyboard(self.keyboard)
+        # ↑↑↑ ADD THESE 3 LINES ↑↑↑
+
     def provide_compass(self):
         values = self.compass.getValues()
         heading = math.atan2(values[0], values[1])
