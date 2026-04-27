@@ -3,7 +3,7 @@
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-from enum import Enum
+from enum import Enum, auto
 
 """
 THE PLAN
@@ -50,9 +50,10 @@ class StudentController:
         self.pf             = ParticleFilter(init_x=-1.0, init_y=0.0, init_heading=0.0, n=NUM_PARTICLES)
         self.viz            = Visualizer()
         self.fsm            = FSM()
-        self._viz_show       = True
+        self._viz_show       = False
         self._step_count    = 0
         self._last_opponent = None  # (world_x, world_y) of last seen opponent
+        self._last_ball     = None  # (world_x, world_y) of last seen ball
 
     def step(self, sensors):
         # Step 1: Run particle filter
@@ -74,16 +75,28 @@ class StudentController:
             oy = y + opponent[0] * math.sin(heading + opponent[1])
             self._last_opponent = (ox, oy)
 
+        # Update last known ball location
+        ball = sensors.get("ball")
+        ball_seen = False # whether a ball was seen or not
+        if ball is not None:
+            bx = x + ball[0] * math.cos(heading + ball[1])
+            by = y + ball[0] * math.sin(heading + ball[1])
+            self._last_ball = (bx, by)
+            ball_seen = True
+
+        
+
         # Update visualisation every DRAW_EVERY steps
         if self._viz_show:
             if self._step_count % DRAW_EVERY == 0:
                 self.viz.update(self.pf, x, y, heading, sensors, self._last_opponent)
+                self._step_count = 0
 
             self._step_count += 1
 
         self_pose = (x, y, heading)
         
-        controls = self.fsm.next_control(self_pose, self._last_opponent, sensors)
+        controls = self.fsm.control(self_pose, ball_seen, self._last_ball, self._last_opponent)
         
 
         # TODO: replace with real controller
@@ -215,10 +228,128 @@ class ParticleFilter:
 # ---------------------------------------------------------------------------
 # Step 2-6: FSM and actions
 # ---------------------------------------------------------------------------
-class FSM:
-    self.__init__(self):
+class State(Enum):
+    SEARCH      = auto()
+    TOWARDS_BALL = auto()
+    DRIBBLE     = auto()
+    INTERCEPT   = auto()
+    GET_OFF_WALL = auto()
 
-    pass
+class FSM:
+    def __init__(self):
+        self._state = State.SEARCH # initially always trying to look for ball
+        self._ball_close_threshold = .5
+        self._dribble_dist_threshold = .3 # distance to start dribbling
+        self._dribble_heading_threshold = math.pi / 2 # plus or minus this amount for it to be good to be kicked.
+
+        # --- Below are some states variables for different actions ---
+        # Search
+        """
+        this ensures that robot will turn one way once direction is determined.
+        None = No direction
+        -1 = Turn CCW
+        +1 = Turn CW
+        """
+        self._search_turn_direction = None 
+
+        # Towards Ball
+        
+
+    def control(self, self_pose, ball_seen, last_ball, last_opponent):
+        self._update_state(self_pose, ball_seen, last_ball, last_opponent) # update what state currently in
+        return self._execute_action(self_pose, last_ball, last_opponent) # then perform an action
+
+    def _update_state(self, self_pose, ball_seen, last_ball, last_opponent):
+        if last_ball is not None:
+            ball_diff_dist, ball_diff_heading = self._get_dist_heading_diff(self_pose, last_ball)
+        if last_opponent is not None:
+            opp_diff_dist, opp_diff_heading = self._get_dist_heading_diff(self_pose, last_opponent)
+
+        if self._state == State.SEARCH:
+            if ball_seen: # if see ball, then go towards ball
+                self._state = State.TOWARDS_BALL
+                self._search_turn_direction = None # reset to no direction that this will be continuously turning
+
+        elif self._state == State.TOWARDS_BALL:
+            if not ball_seen:
+                self._state = State.SEARCH # Ball is not seen
+            elif ball_diff_dist < self._dribble_dist_threshold and (-abs(self._dribble_heading_threshold) < ball_diff_heading < abs(self._dribble_heading_threshold)):
+                # if close enough and facing the right way to dribble, then dribble
+                self._state = State.DRIBBLE
+            # TODO: add some sort of state transition to go to INTERCEPT
+        elif self._state == State.DRIBBLE:
+            if not ball_seen:
+                self._state = State.SEARCH # if ball is not seen
+            elif not (ball_diff_dist < self._dribble_dist_threshold and (-abs(self._dribble_heading_threshold) < ball_diff_heading < abs(self._dribble_heading_threshold))):
+                # if no longer in the dribble threshold but the ball is seen, then we need to go towards ball again
+                self._state = State.TOWARDS_BALL
+        elif self._state == State.INTERCEPT:
+            if not ball_seen:
+                self._state = State.SEARCH # if ball is not seen
+            pass  # TODO
+
+    def _get_dist_heading_diff(self, self_pose, other_pose):
+        x, y, heading = self_pose
+        tx, ty = other_pose
+
+        dx   = tx - x
+        dy   = ty - y
+        dist = math.sqrt(dx**2 + dy**2)
+
+        target_angle  = math.atan2(dy, dx)
+        heading_diff  = target_angle - heading
+        heading_diff  = (heading_diff + math.pi) % (2 * math.pi) - math.pi  # wrap to [-pi, pi]
+
+        return dist, heading_diff
+
+    def _execute_action(self, self_pose, last_ball, last_opponent):
+        if self._state == State.SEARCH:
+            return self._search(self_pose, last_ball)
+        elif self._state == State.TOWARDS_BALL:
+            return self._towards_ball(self_pose, last_ball)
+        elif self._state == State.DRIBBLE:
+            return self._dribble(self_pose, last_ball)
+        elif self._state == State.INTERCEPT:
+            return self._intercept(self_pose, last_opponent)
+
+    def _search(self, self_pose, last_ball): 
+        print("SEARCH")
+
+        if self._search_turn_direction == None:
+            # if haven't determined a direction, then determine a spin direction
+            if last_ball == None:
+                # if don't know last ball position
+                self._search_turn_direction = -1 # arbitrarily choose to turn CCW
+            else:
+                # if do know last ball position, then want to choose the faster turn direction
+                ball_diff_dist, ball_diff_heading = self._get_dist_heading_diff(self_pose, last_ball)
+                print(ball_diff_heading)
+                if ball_diff_heading < 0: 
+                    # if to the left, then turn CCW
+                    self._search_turn_direction = 1
+                else:
+                    # if to the right, then turn CW
+                    self._search_turn_direction = -1
+        
+        if self._search_turn_direction == -1:
+            # spin CCW
+            return {"left_motor": -6.25, "right_motor": 6.25}
+        else:
+            # spin CW
+            return {"left_motor": 6.25, "right_motor": -6.25}
+    def _towards_ball(self, pose, ball_pos): 
+        print("TOWARDS_BALL")
+        return {"left_motor": 6.25, "right_motor": 6.25}
+    def _dribble(self, pose, ball_pos): 
+        print("DRIBBLE")
+        return {"left_motor": 0, "right_motor": 0}
+    def _intercept(self, pose, opponent_pos):
+        print("INTERCEPT") 
+        return {"left_motor": 0, "right_motor": 6.25}
+    
+    
+
+
 
 # ---------------------------------------------------------------------------
 # Visualizer

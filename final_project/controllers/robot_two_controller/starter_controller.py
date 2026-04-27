@@ -296,7 +296,7 @@ class StudentController:
             return {"left_motor": 0.0, "right_motor": 0.0}
 
         key = self._keyboard.getKey()
-
+        print(sensors.get("ball"))
         if key == ord('W'):
             self._left  = DRIVE_SPEED
             self._right = DRIVE_SPEED
