@@ -50,7 +50,7 @@ class StudentController:
         self.pf             = ParticleFilter(init_x=-1.0, init_y=0.0, init_heading=0.0, n=NUM_PARTICLES)
         self.viz            = Visualizer()
         self.fsm            = FSM()
-        self._viz_show       = False
+        self._viz_show       = True
         self._step_count    = 0
         self._last_opponent = None  # (world_x, world_y) of last seen opponent
         self._last_ball     = None  # (world_x, world_y) of last seen ball
@@ -84,17 +84,17 @@ class StudentController:
             self._last_ball = (bx, by)
             ball_seen = True
 
-        
 
         # Update visualisation every DRAW_EVERY steps
         if self._viz_show:
             if self._step_count % DRAW_EVERY == 0:
-                self.viz.update(self.pf, x, y, heading, sensors, self._last_opponent)
+                self.viz.update(self.pf, x, y, heading, sensors, self._last_opponent, self._last_ball, self.fsm)
                 self._step_count = 0
 
             self._step_count += 1
 
         self_pose = (x, y, heading)
+        print(self_pose)
         
         controls = self.fsm.control(self_pose, ball_seen, self._last_ball, self._last_opponent)
         
@@ -239,8 +239,9 @@ class FSM:
     def __init__(self):
         self._state = State.SEARCH # initially always trying to look for ball
         self._ball_close_threshold = .5
-        self._dribble_dist_threshold = .3 # distance to start dribbling
+        self._dribble_dist_threshold = .15 # distance to start dribbling
         self._dribble_heading_threshold = math.pi / 2 # plus or minus this amount for it to be good to be kicked.
+        self._wall_safety = (4.9, 3.5) # 4.9 max goal to goal, and 3.5 is max for other way
 
         # --- Below are some states variables for different actions ---
         # Search
@@ -253,7 +254,7 @@ class FSM:
         self._search_turn_direction = None 
 
         # Towards Ball
-        
+
 
     def control(self, self_pose, ball_seen, last_ball, last_opponent):
         self._update_state(self_pose, ball_seen, last_ball, last_opponent) # update what state currently in
@@ -272,17 +273,26 @@ class FSM:
 
         elif self._state == State.TOWARDS_BALL:
             if not ball_seen:
-                self._state = State.SEARCH # Ball is not seen
-            elif ball_diff_dist < self._dribble_dist_threshold and (-abs(self._dribble_heading_threshold) < ball_diff_heading < abs(self._dribble_heading_threshold)):
-                # if close enough and facing the right way to dribble, then dribble
-                self._state = State.DRIBBLE
+                self._state = State.SEARCH
+            else:
+                approach_x, approach_y, desired_heading = self._get_approach_pose(last_ball)
+                dist, _  = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
+                heading_err = desired_heading - self_pose[2]
+                heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi
+                if dist < self._dribble_dist_threshold and abs(heading_err) < self._dribble_heading_threshold:
+                    self._state = State.DRIBBLE
             # TODO: add some sort of state transition to go to INTERCEPT
         elif self._state == State.DRIBBLE:
             if not ball_seen:
                 self._state = State.SEARCH # if ball is not seen
-            elif not (ball_diff_dist < self._dribble_dist_threshold and (-abs(self._dribble_heading_threshold) < ball_diff_heading < abs(self._dribble_heading_threshold))):
-                # if no longer in the dribble threshold but the ball is seen, then we need to go towards ball again
-                self._state = State.TOWARDS_BALL
+            else:
+                approach_x, approach_y, desired_heading = self._get_approach_pose(last_ball)
+                dist, _  = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
+                heading_err = desired_heading - self_pose[2]
+                heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi
+                if not (dist < self._dribble_dist_threshold and abs(heading_err) < self._dribble_heading_threshold):
+                    # if no longer in the dribble threshold but the ball is seen, then we need to go towards ball again
+                    self._state = State.TOWARDS_BALL
         elif self._state == State.INTERCEPT:
             if not ball_seen:
                 self._state = State.SEARCH # if ball is not seen
@@ -306,7 +316,7 @@ class FSM:
         if self._state == State.SEARCH:
             return self._search(self_pose, last_ball)
         elif self._state == State.TOWARDS_BALL:
-            return self._towards_ball(self_pose, last_ball)
+            return self._towards_ball(self_pose, last_ball, last_opponent)
         elif self._state == State.DRIBBLE:
             return self._dribble(self_pose, last_ball)
         elif self._state == State.INTERCEPT:
@@ -337,12 +347,77 @@ class FSM:
         else:
             # spin CW
             return {"left_motor": 6.25, "right_motor": -6.25}
-    def _towards_ball(self, pose, ball_pos): 
-        print("TOWARDS_BALL")
-        return {"left_motor": 6.25, "right_motor": 6.25}
+
+    def _towards_ball(self, self_pose, ball_pos, last_opponent):
+        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent)
+        x, y, heading = self_pose
+
+        dist_to_approach, heading_to_approach = self._get_dist_heading_diff(
+            self_pose, (approach_x, approach_y)
+        )
+
+        # Phase 1 — get to position
+        if dist_to_approach > self._dribble_dist_threshold - .05 :
+            # Turn toward approach point then drive
+            K_turn  = 2.0
+            forward = 6.25 * max(0.4, 1.0 - abs(heading_to_approach) / math.pi)
+            left    = max(-6.25, min(6.25, forward - K_turn * heading_to_approach))
+            right   = max(-6.25, min(6.25, forward + K_turn * heading_to_approach))
+            print(f"TOWARDS_BALL phase 1 — dist={dist_to_approach:.2f}  hdiff={math.degrees(heading_to_approach):.1f}°")
+            return {"left_motor": left, "right_motor": right}
+
+        # Phase 2 — align heading
+        heading_err = desired_heading - heading
+        heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi  # wrap
+
+        if abs(heading_err) > self._dribble_heading_threshold:
+            # Spin in place toward desired heading
+            turn_speed = 3.0 * (1 if heading_err > 0 else -1)
+            print(f"TOWARDS_BALL phase 2 — heading_err={math.degrees(heading_err):.1f}°")
+            return {"left_motor": -turn_speed, "right_motor": turn_speed}
+
+        # Both position and heading satisfied — transition to DRIBBLE next step
+        print("TOWARDS_BALL — at approach pose, ready to dribble")
+        return {"left_motor": 0.0, "right_motor": 0.0}
+    
+    def _get_approach_pose(self, ball_pos, self_pose=None, opponent_pos=None, offset=0.2):
+        """Get the point behind the ball, between ball and GOAL, plus desired heading."""
+        bx, by = ball_pos
+        gx, gy = GOALS[0]
+
+        # Vector from ball toward goal
+        dx = gx - bx
+        dy = gy - by
+        dist = math.sqrt(dx**2 + dy**2)
+
+        # Unit vector from ball toward goal
+        nx = dx / dist
+        ny = dy / dist
+
+        # Desired heading: facing from approach point toward goal through ball
+        desired_heading = math.atan2(dy, dx)
+
+        # If opponent is closer to ball than we are, skip approach point and go straight to ball
+        if opponent_pos is not None and self_pose is not None:
+            opp_to_ball = math.sqrt((opponent_pos[0]-bx)**2 + (opponent_pos[1]-by)**2)
+            us_to_ball  = math.sqrt((self_pose[0]-bx)**2  + (self_pose[1]-by)**2)
+            if opp_to_ball < us_to_ball:
+                return (bx, by, desired_heading)  # urgent — go straight to ball
+
+        # Approach point: step back from ball away from goal
+        ox = bx - nx * offset
+        oy = by - ny * offset
+
+        # Clamp to safe field bounds
+        ax = max(-self._wall_safety[0], min(self._wall_safety[0], ox))
+        ay = max(-self._wall_safety[1], min(self._wall_safety[1], oy))
+
+        return (ax, ay, desired_heading)
+
+
     def _dribble(self, pose, ball_pos): 
         print("DRIBBLE")
-        return {"left_motor": 0, "right_motor": 0}
+        return {"left_motor": 6.25, "right_motor":6.250}
     def _intercept(self, pose, opponent_pos):
         print("INTERCEPT") 
         return {"left_motor": 0, "right_motor": 6.25}
@@ -369,7 +444,10 @@ class Visualizer:
         # Reusable plot objects so we don't redraw everything from scratch
         self._particles_sc  = self.ax.scatter([], [], s=8, c='cyan', alpha=0.5, zorder=3, label='Particles')
         self._robot_arrow   = None
-        self._ball_sc       = self.ax.scatter([], [], s=120, c='orange', marker='o', zorder=5, label='Ball (est)')
+        self._ball_sc       = self.ax.scatter([], [], s=120, c='orange', marker='o', zorder=5, label='Ball (seen)')
+        self._ball_last_sc  = self.ax.scatter([], [], s=80,  c='orange', marker='o', alpha=0.3, zorder=4, label='Ball (last known)')
+        self._approach_sc   = self.ax.scatter([], [], s=120, c='yellow', marker='x', linewidths=2, zorder=5, label='Approach point')
+        self._shot_line,    = self.ax.plot([], [], 'y--', linewidth=1.2, alpha=0.7, zorder=3, label='Shot line')
         self._opponent_sc   = self.ax.scatter([], [], s=150, c='red', marker='s', zorder=5, label='Opponent (seen)')
         self._opponent_last = self.ax.scatter([], [], s=150, c='red', marker='s', alpha=0.3,
                                               zorder=4, label='Opponent (last known)')
@@ -422,7 +500,7 @@ class Visualizer:
         for spine in ax.spines.values():
             spine.set_edgecolor('white')
 
-    def update(self, pf, est_x, est_y, est_heading, sensors, last_opponent):
+    def update(self, pf, est_x, est_y, est_heading, sensors, last_opponent, last_ball, fsm):
         # Particles
         self._particles_sc.set_offsets(pf.particles[:, :2])
 
@@ -439,14 +517,30 @@ class Visualizer:
             zorder=6
         )
 
-        # Ball
+        # Ball — bright if currently seen, faded if last known only
         ball = sensors.get("ball")
         if ball is not None:
             bx = est_x + ball[0] * math.cos(est_heading + ball[1])
             by = est_y + ball[0] * math.sin(est_heading + ball[1])
             self._ball_sc.set_offsets([[bx, by]])
+            self._ball_last_sc.set_offsets(np.empty((0, 2)))
         else:
             self._ball_sc.set_offsets(np.empty((0, 2)))
+            if last_ball is not None:
+                self._ball_last_sc.set_offsets([[last_ball[0], last_ball[1]]])
+            else:
+                self._ball_last_sc.set_offsets(np.empty((0, 2)))
+
+        # Shot line + approach point — draw when we have a ball position
+        if last_ball is not None:
+            ax_pt, ay_pt, _ = fsm._get_approach_pose(last_ball)
+            self._approach_sc.set_offsets([[ax_pt, ay_pt]])
+            # Dashed line from ball to target goal showing intended shot
+            gx, gy = GOALS[0]
+            self._shot_line.set_data([last_ball[0], gx], [last_ball[1], gy])
+        else:
+            self._approach_sc.set_offsets(np.empty((0, 2)))
+            self._shot_line.set_data([], [])
 
         # Opponent — bright when seen, faded ghost when last known only
         opponent = sensors.get("opponent")
@@ -470,7 +564,8 @@ class Visualizer:
             f"pos=({est_x:.2f}, {est_y:.2f})  "
             f"heading={math.degrees(est_heading):.1f}°  "
             f"std=({sx:.3f}, {sy:.3f})  "
-            f"ESS={ess:.0f}/{pf.n}"
+            f"ESS={ess:.0f}/{pf.n}  "
+            f"state={fsm._state.name}"
             f"{opp_str}"
         )
 
