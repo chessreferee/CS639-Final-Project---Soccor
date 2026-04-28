@@ -94,7 +94,7 @@ class StudentController:
             self._step_count += 1
 
         self_pose = (x, y, heading)
-        print(self_pose)
+        # print(self_pose)
         
         controls = self.fsm.control(self_pose, ball_seen, self._last_ball, self._last_opponent)
         
@@ -229,18 +229,19 @@ class ParticleFilter:
 # Step 2-6: FSM and actions
 # ---------------------------------------------------------------------------
 class State(Enum):
-    SEARCH      = auto()
+    SEARCH       = auto()
     TOWARDS_BALL = auto()
-    DRIBBLE     = auto()
-    INTERCEPT   = auto()
+    ORBIT        = auto()
+    ALIGN        = auto()
+    DRIBBLE      = auto()
+    INTERCEPT    = auto()
     GET_OFF_WALL = auto()
 
 class FSM:
     def __init__(self):
         self._state = State.SEARCH # initially always trying to look for ball
         self._ball_close_threshold = .5
-        self._dribble_dist_threshold = .15 # distance to start dribbling
-        self._dribble_heading_threshold = math.pi / 2 # plus or minus this amount for it to be good to be kicked.
+        
         self._wall_safety = (4.9, 3.5) # 4.9 max goal to goal, and 3.5 is max for other way
 
         # --- Below are some states variables for different actions ---
@@ -252,8 +253,17 @@ class FSM:
         +1 = Turn CW
         """
         self._search_turn_direction = None 
+        self._search_centered_threshold = math.pi / 6 # how centered needed to be for a search
 
         # Towards Ball
+        self._orbit_radius = .5
+        self._orbit_threshold = 1 # distance to start orbitting around
+        self._orbit_pull = 1.75 # once enter orbit, multiplier to get out
+        self._orbit_path = None # path to goal position
+
+        # Dribble
+        self._dribble_dist_threshold = .067 # distance to start dribbling
+        self._dribble_heading_threshold = math.pi / 18 # plus or minus this amount for it to be good to be kicked.
 
 
     def control(self, self_pose, ball_seen, last_ball, last_opponent):
@@ -267,36 +277,80 @@ class FSM:
             opp_diff_dist, opp_diff_heading = self._get_dist_heading_diff(self_pose, last_opponent)
 
         if self._state == State.SEARCH:
-            if ball_seen: # if see ball, then go towards ball
+            if ball_seen and abs(ball_diff_heading) <= self._search_centered_threshold: # if see ball, then go towards ball
                 self._state = State.TOWARDS_BALL
                 self._search_turn_direction = None # reset to no direction that this will be continuously turning
 
         elif self._state == State.TOWARDS_BALL:
             if not ball_seen:
                 self._state = State.SEARCH
-            else:
-                approach_x, approach_y, desired_heading = self._get_approach_pose(last_ball)
-                dist, _  = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
-                heading_err = desired_heading - self_pose[2]
-                heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi
-                if dist < self._dribble_dist_threshold and abs(heading_err) < self._dribble_heading_threshold:
+            elif last_ball is not None and ball_diff_dist < self._orbit_radius:
+                # this means close enough to start orbitting
+                dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
+                dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
+                # check which state to be in
+                if dist_ok and heading_ok:
                     self._state = State.DRIBBLE
-            # TODO: add some sort of state transition to go to INTERCEPT
+                elif dist_ok:
+                    self._state = State.ALIGN
+                elif dist_robot_ball < self._orbit_radius: # within the orbit's pull
+                    self._state = State.ORBIT  # close enough to start orbiting
+
+        elif self._state == State.ORBIT:
+            dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
+            dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
+            print(f"ORBIT: dist_robot_ball={dist_robot_ball:.2f}")
+            if dist_ok and heading_ok:
+                self._state = State.DRIBBLE
+            elif dist_robot_ball > self._orbit_radius * self._orbit_pull:
+                    # if fall out of orbit, then need to go back towards ball
+                    self._state = State.TOWARDS_BALL
+            elif dist_ok:
+                self._state = State.ALIGN
+
+        elif self._state == State.ALIGN:
+            if not ball_seen:
+                self._state = State.SEARCH
+            else:
+                dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
+                dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
+                if dist_ok and heading_ok:
+                    self._state = State.DRIBBLE
+                elif dist_robot_ball > self._orbit_radius * self._orbit_pull:
+                    # if fall out of orbit, then need to go back towards ball
+                    self._state = State.TOWARDS_BALL
+                elif not dist_ok and heading_ok:
+                    self._state = State.ORBIT # need to turn more around circle to get to correct position
+                
+                # if don't go through any, then dist_ok is fine, but heading is not right yet
+
         elif self._state == State.DRIBBLE:
             if not ball_seen:
-                self._state = State.SEARCH # if ball is not seen
+                self._state = State.SEARCH
             else:
-                approach_x, approach_y, desired_heading = self._get_approach_pose(last_ball)
-                dist, _  = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
-                heading_err = desired_heading - self_pose[2]
-                heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi
-                if not (dist < self._dribble_dist_threshold and abs(heading_err) < self._dribble_heading_threshold):
-                    # if no longer in the dribble threshold but the ball is seen, then we need to go towards ball again
+                dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
+                if not dist_ok:
                     self._state = State.TOWARDS_BALL
         elif self._state == State.INTERCEPT:
             if not ball_seen:
                 self._state = State.SEARCH # if ball is not seen
             pass  # TODO
+    def _robot_ball_dist_and_heading_checker(self, self_pose, ball_pos, last_opponent, dist_mult = 1, heading_mult = 1):
+        """
+        Returns (dist_ok, heading_ok) booleans.
+        dist_ok    — True if robot is within _dribble_dist_threshold of the approach point
+        heading_ok — True if robot heading is within _dribble_heading_threshold of desired heading
+        """
+
+        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, offset=self._orbit_radius)
+        
+        dist, _ = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
+        heading_err = (desired_heading - self_pose[2] + math.pi) % (2 * math.pi) - math.pi
+
+        dist_ok    = dist < self._dribble_dist_threshold * dist_mult
+        heading_ok = abs(heading_err) < self._dribble_heading_threshold * heading_mult
+
+        return (dist_ok, heading_ok)
 
     def _get_dist_heading_diff(self, self_pose, other_pose):
         x, y, heading = self_pose
@@ -319,6 +373,10 @@ class FSM:
             return self._towards_ball(self_pose, last_ball, last_opponent)
         elif self._state == State.DRIBBLE:
             return self._dribble(self_pose, last_ball)
+        elif self._state == State.ORBIT:
+            return self._orbit(self_pose, last_ball, last_opponent)
+        elif self._state == State.ALIGN:
+            return self._align(self_pose, last_ball, last_opponent)
         elif self._state == State.INTERCEPT:
             return self._intercept(self_pose, last_opponent)
 
@@ -333,7 +391,7 @@ class FSM:
             else:
                 # if do know last ball position, then want to choose the faster turn direction
                 ball_diff_dist, ball_diff_heading = self._get_dist_heading_diff(self_pose, last_ball)
-                print(ball_diff_heading)
+                # print(ball_diff_heading)
                 if ball_diff_heading < 0: 
                     # if to the left, then turn CCW
                     self._search_turn_direction = 1
@@ -349,38 +407,23 @@ class FSM:
             return {"left_motor": 6.25, "right_motor": -6.25}
 
     def _towards_ball(self, self_pose, ball_pos, last_opponent):
-        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent)
-        x, y, heading = self_pose
+        print("TOWARDS_BALL")
+        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius)
 
         dist_to_approach, heading_to_approach = self._get_dist_heading_diff(
             self_pose, (approach_x, approach_y)
         )
 
-        # Phase 1 — get to position
-        if dist_to_approach > self._dribble_dist_threshold - .05 :
-            # Turn toward approach point then drive
-            K_turn  = 2.0
-            forward = 6.25 * max(0.4, 1.0 - abs(heading_to_approach) / math.pi)
-            left    = max(-6.25, min(6.25, forward - K_turn * heading_to_approach))
-            right   = max(-6.25, min(6.25, forward + K_turn * heading_to_approach))
-            print(f"TOWARDS_BALL phase 1 — dist={dist_to_approach:.2f}  hdiff={math.degrees(heading_to_approach):.1f}°")
-            return {"left_motor": left, "right_motor": right}
+        # Just drive toward the approach point — orbit/align handle the rest
+        K_turn  = 2.0
+        forward = 6.25 * max(0.4, 1.0 - abs(heading_to_approach) / math.pi)
+        left    = max(-6.25, min(6.25, forward - K_turn * heading_to_approach))
+        right   = max(-6.25, min(6.25, forward + K_turn * heading_to_approach))
 
-        # Phase 2 — align heading
-        heading_err = desired_heading - heading
-        heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi  # wrap
-
-        if abs(heading_err) > self._dribble_heading_threshold:
-            # Spin in place toward desired heading
-            turn_speed = 3.0 * (1 if heading_err > 0 else -1)
-            print(f"TOWARDS_BALL phase 2 — heading_err={math.degrees(heading_err):.1f}°")
-            return {"left_motor": -turn_speed, "right_motor": turn_speed}
-
-        # Both position and heading satisfied — transition to DRIBBLE next step
-        print("TOWARDS_BALL — at approach pose, ready to dribble")
-        return {"left_motor": 0.0, "right_motor": 0.0}
+        print(f"TOWARDS_BALL — dist={dist_to_approach:.2f}  hdiff={math.degrees(heading_to_approach):.1f}°")
+        return {"left_motor": left, "right_motor": right}
     
-    def _get_approach_pose(self, ball_pos, self_pose=None, opponent_pos=None, offset=0.2):
+    def _get_approach_pose(self, ball_pos, self_pose=None, opponent_pos=None, offset=0.3):
         """Get the point behind the ball, between ball and GOAL, plus desired heading."""
         bx, by = ball_pos
         gx, gy = GOALS[0]
@@ -414,10 +457,76 @@ class FSM:
 
         return (ax, ay, desired_heading)
 
+    def _orbit(self, self_pose, ball_pos, last_opponent):
+        print("ORBIT")
+        approach_x, approach_y, _ = self._get_approach_pose(ball_pos)
+        bx, by  = ball_pos
+        x, y, _ = self_pose
+
+        # --- Build/update path when ball is known ---
+        if ball_pos is not None:
+            # Direction from ball to robot (current angle on circle)
+            dx_r = x - bx
+            dy_r = y - by
+            start_angle = math.atan2(dy_r, dx_r)
+
+            # Direction from ball to approach point (target angle on circle)
+            dx_a = approach_x - bx
+            dy_a = approach_y - by
+            end_angle = math.atan2(dy_a, dx_a)
+
+            # Figure out shortest arc direction (CW or CCW)
+            angle_diff = (end_angle - start_angle + math.pi) % (2 * math.pi) - math.pi
+
+            # Generate 10 waypoints along the arc
+            num_points = 10
+            self._orbit_path = []
+            for i in range(1, num_points + 1):
+                frac  = i / num_points
+                angle = start_angle + frac * angle_diff
+                wx    = bx + self._orbit_radius * math.cos(angle)
+                wy    = by + self._orbit_radius * math.sin(angle)
+                self._orbit_path.append((wx, wy))
+
+        # --- No path available, stop ---
+        if not self._orbit_path:
+            return {"left_motor": 0.0, "right_motor": 0.0}
+
+        # --- Pop waypoints we've already reached ---
+        while self._orbit_path:
+            next_wp = self._orbit_path[0]
+            dist_to_wp, _ = self._get_dist_heading_diff(self_pose, next_wp)
+            if dist_to_wp < self._dribble_dist_threshold - .05:
+                self._orbit_path.pop(0)  # reached this waypoint, move to next
+            else:
+                break  # not there yet, drive toward it
+
+        # --- All waypoints consumed ---
+        if not self._orbit_path:
+            return {"left_motor": 0.0, "right_motor": 0.0}
+
+        # --- Drive toward next waypoint using heading control ---
+        next_wp = self._orbit_path[0]
+        dist_to_wp, heading_to_wp = self._get_dist_heading_diff(self_pose, next_wp)
+
+        K_turn  = 2.0
+        forward = 6.25 * max(0.3, 1.0 - abs(heading_to_wp) / math.pi)
+        left    = max(-6.25, min(6.25, forward - K_turn * heading_to_wp))
+        right   = max(-6.25, min(6.25, forward + K_turn * heading_to_wp))
+
+        print(f"ORBIT — {len(self._orbit_path)} waypoints left  dist={dist_to_wp:.2f}  hdiff={math.degrees(heading_to_wp):.1f}°")
+        return {"left_motor": left, "right_motor": right}
+    
+    def _align(self, self_pose, ball_pos, last_opponent):
+        _, __, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent)
+        heading_err = (desired_heading - self_pose[2] + math.pi) % (2 * math.pi) - math.pi
+        turn_speed  = 6.25 if heading_err > 0 else -6.25
+        print(f"ALIGN — heading_err={math.degrees(heading_err):.1f}°")
+        return {"left_motor": -turn_speed, "right_motor": turn_speed}
 
     def _dribble(self, pose, ball_pos): 
         print("DRIBBLE")
-        return {"left_motor": 6.25, "right_motor":6.250}
+        return {"left_motor": 0, "right_motor":0}
     def _intercept(self, pose, opponent_pos):
         print("INTERCEPT") 
         return {"left_motor": 0, "right_motor": 6.25}
@@ -447,6 +556,7 @@ class Visualizer:
         self._ball_sc       = self.ax.scatter([], [], s=120, c='orange', marker='o', zorder=5, label='Ball (seen)')
         self._ball_last_sc  = self.ax.scatter([], [], s=80,  c='orange', marker='o', alpha=0.3, zorder=4, label='Ball (last known)')
         self._approach_sc   = self.ax.scatter([], [], s=120, c='yellow', marker='x', linewidths=2, zorder=5, label='Approach point')
+        self._orbit_dots = self.ax.scatter([], [], s=30, c='lime', marker='o', alpha=0.6, zorder=4, label='Orbit path')
         self._shot_line,    = self.ax.plot([], [], 'y--', linewidth=1.2, alpha=0.7, zorder=3, label='Shot line')
         self._opponent_sc   = self.ax.scatter([], [], s=150, c='red', marker='s', zorder=5, label='Opponent (seen)')
         self._opponent_last = self.ax.scatter([], [], s=150, c='red', marker='s', alpha=0.3,
@@ -541,6 +651,13 @@ class Visualizer:
         else:
             self._approach_sc.set_offsets(np.empty((0, 2)))
             self._shot_line.set_data([], [])
+        
+        # Orbit waypoints — draw remaining path dots
+        if fsm._orbit_path:
+            orbit_pts = np.array(fsm._orbit_path)
+            self._orbit_dots.set_offsets(orbit_pts)
+        else:
+            self._orbit_dots.set_offsets(np.empty((0, 2)))
 
         # Opponent — bright when seen, faded ghost when last known only
         opponent = sensors.get("opponent")
