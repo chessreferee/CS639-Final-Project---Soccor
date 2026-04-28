@@ -328,21 +328,28 @@ class FSM:
             if not ball_seen:
                 self._state = State.SEARCH
             else:
-                dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
-                if not dist_ok:
+                dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent, heading_mult= 1.5, offset = .21)
+                dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
+                if dist_robot_ball > self._orbit_radius * self._orbit_pull:
+                    # if fall out of orbit, then need to go back towards ball
                     self._state = State.TOWARDS_BALL
+                elif not heading_ok and dist_ok:
+                    # if heading is not good anymore, then Align
+                    self._state = State.ALIGN
         elif self._state == State.INTERCEPT:
             if not ball_seen:
                 self._state = State.SEARCH # if ball is not seen
             pass  # TODO
-    def _robot_ball_dist_and_heading_checker(self, self_pose, ball_pos, last_opponent, dist_mult = 1, heading_mult = 1):
+    def _robot_ball_dist_and_heading_checker(self, self_pose, ball_pos, last_opponent, dist_mult = 1, heading_mult = 1, offset = None):
         """
         Returns (dist_ok, heading_ok) booleans.
         dist_ok    — True if robot is within _dribble_dist_threshold of the approach point
         heading_ok — True if robot heading is within _dribble_heading_threshold of desired heading
         """
+        if offset is None:
+            offset=self._orbit_radius
 
-        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, offset=self._orbit_radius)
+        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, offset)
         
         dist, _ = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
         heading_err = (desired_heading - self_pose[2] + math.pi) % (2 * math.pi) - math.pi
@@ -522,15 +529,39 @@ class FSM:
         return {"left_motor": left, "right_motor": right}
     
     def _align(self, self_pose, ball_pos, last_opponent):
+        """
+        Once you orbit to correct position, you align yourself to the ball
+        """
         _, __, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent)
         heading_err = (desired_heading - self_pose[2] + math.pi) % (2 * math.pi) - math.pi
         turn_speed  = 6.25 if heading_err > 0 else -6.25
         print(f"ALIGN — heading_err={math.degrees(heading_err):.1f}°")
         return {"left_motor": -turn_speed, "right_motor": turn_speed}
 
-    def _dribble(self, pose, ball_pos): 
+    def _dribble(self, self_pose, ball_pos):
         print("DRIBBLE")
-        return {"left_motor": 0, "right_motor":0}
+        ball_diff_dist, ball_diff_heading  = self._get_dist_heading_diff(self_pose, ball_pos)
+        goal_diff_dist, goal_diff_heading  = self._get_dist_heading_diff(self_pose, GOALS[0])
+
+        # Weight how much to care about each:
+        # — ball_diff_heading: keep ball centered in front of you (tight control)
+        # — goal_diff_heading: steer toward goal (looser, longer range)
+        K_ball = 1.75   # how aggressively to keep ball centered
+        K_goal = 1.4   # how aggressively to steer toward goal
+
+        goal_ball_heading = goal_diff_heading - ball_diff_heading # see how far off the angles are from one another
+
+        # Blend the two errors — ball centering dominates, goal heading assists
+        steering = K_ball * ball_diff_heading + K_goal * goal_ball_heading
+
+        # Scale forward speed down if steering correction is large
+        forward = 6.25 * max(0.4, 1.0 - abs(steering) / math.pi)
+
+        left  = max(-6.25, min(6.25, forward - steering))
+        right = max(-6.25, min(6.25, forward + steering))
+
+        print(f"DRIBBLE — ball_hdiff={math.degrees(ball_diff_heading):.1f}°  goal_hdiff={math.degrees(goal_diff_heading):.1f}°  steering={math.degrees(steering):.1f}°")
+        return {"left_motor": left, "right_motor": right}
     def _intercept(self, pose, opponent_pos):
         print("INTERCEPT") 
         return {"left_motor": 0, "right_motor": 6.25}
