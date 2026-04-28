@@ -256,7 +256,7 @@ class FSM:
         self._search_centered_threshold = math.pi / 6 # how centered needed to be for a search
 
         # Towards Ball
-        self._orbit_radius = .5
+        self._orbit_radius = .3
         self._orbit_threshold = 1 # distance to start orbitting around
         self._orbit_pull = 1.75 # once enter orbit, multiplier to get out
         self._orbit_path = None # path to goal position
@@ -458,8 +458,12 @@ class FSM:
         return (ax, ay, desired_heading)
 
     def _orbit(self, self_pose, ball_pos, last_opponent):
+        """
+        Once in orbit, breaks down 10 points that will lead to going to correct
+        """
+
         print("ORBIT")
-        approach_x, approach_y, _ = self._get_approach_pose(ball_pos)
+        approach_x, approach_y, _ = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius)
         bx, by  = ball_pos
         x, y, _ = self_pose
 
