@@ -28,6 +28,8 @@ CORNERS = [(-4.5, 3.0), (-4.5, -3.0), (4.5, 3.0), (4.5, -3.0)]
 CROSSES = [(3.25, 0.0), (-3.25, 0.0)]
 CENTER  = [(0.0, 0.0)]
 
+GOAL_MORE = (4.67, 0.0) # just a little more to ensure ball is kicked in
+
 NUM_PARTICLES   = 150
 RESAMPLE_THRESH = 0.5
 
@@ -98,8 +100,6 @@ class StudentController:
         
         controls = self.fsm.control(self_pose, ball_seen, self._last_ball, self._last_opponent)
         
-
-        # TODO: replace with real controller
         return controls
 
 # ---------------------------------------------------------------------------
@@ -244,7 +244,7 @@ class FSM:
         self._ball_close_threshold = .5
         
         self._wall_safety = (4.9, 3.5) # 4.9 max goal to goal, and 3.5 is max for other way
-        self._last_20_poses = []
+        self._last_50_poses = []
 
         # --- Below are some states variables for different actions ---
         # Search
@@ -269,9 +269,9 @@ class FSM:
 
 
     def control(self, self_pose, ball_seen, last_ball, last_opponent):
-        self._last_20_poses.append(self_pose)
-        if len(self._last_20_poses) > 20:
-            self._last_20_poses.pop(0)
+        self._last_50_poses.append(self_pose)
+        if len(self._last_50_poses) > 50:
+            self._last_50_poses.pop(0) #TODO: work on moving backwards if stuck on wall, may need to have something in particle filter that will let particle filter know of backward movement
         
         self._update_state(self_pose, ball_seen, last_ball, last_opponent) # update what state currently in
         return self._execute_action(self_pose, last_ball, last_opponent) # then perform an action
@@ -436,10 +436,10 @@ class FSM:
         print(f"TOWARDS_BALL — dist={dist_to_approach:.2f}  hdiff={math.degrees(heading_to_approach):.1f}°")
         return {"left_motor": left, "right_motor": right}
     
-    def _get_approach_pose(self, ball_pos, self_pose=None, opponent_pos=None, offset=0.3):
+    def _get_approach_pose(self, ball_pos, self_pose=None, opponent_pos=None, offset=0.3, goal=GOAL_MORE):
         """Get the point behind the ball, between ball and GOAL, plus desired heading."""
         bx, by = ball_pos
-        gx, gy = GOALS[0]
+        gx, gy = goal
 
         # Vector from ball toward goal
         dx = gx - bx
@@ -469,6 +469,36 @@ class FSM:
         ay = max(-self._wall_safety[1], min(self._wall_safety[1], oy))
 
         return (ax, ay, desired_heading)
+
+    # TODO add check for corner case and maybe have 100 steps once you leave corner case to keep on going to the Cross
+    def _check_corner_case(self, self_pose):
+        """
+        Check if at the enemy side corners, then should first try to go to CROSS in front of enemy goal first
+        """
+
+        x, y, _ = self_pose
+
+        L = 2.2
+
+        # --- Top-right corner (4.5, 3.0) ---
+        cx, cy = 4.5, 3.0
+        dx = cx - x   # distance inward from right wall
+        dy = cy - y   # distance downward from top wall
+
+        if 0 <= dx <= L and 0 <= dy <= L: # first makes sure near the corner in the bounds
+            if dx + dy <= L: # draws a line where the corner is the origin. (a simple y = L - x equation)
+                return True
+
+        # --- Bottom-right corner (4.5, -3.0) ---
+        cx, cy = 4.5, -3.0
+        dx = cx - x
+        dy = y - cy   # upward from bottom wall
+
+        if 0 <= dx <= L and 0 <= dy <= L:
+            if dx + dy <= L:
+                return True
+
+        return False
 
     def _orbit(self, self_pose, ball_pos, last_opponent):
         """
@@ -504,6 +534,11 @@ class FSM:
                 wx    = bx + self._orbit_radius * math.cos(angle)
                 wy    = by + self._orbit_radius * math.sin(angle)
                 self._orbit_path.append((wx, wy))
+
+            # skip first 2 waypoints as they are not needed as you can just do waypoints 3-10, which takes a more direct path to the approach pose
+            # This also helps with dribble as if a waypoint is behind itself, it often turns the wrong way, making dribble quite slow
+            self._orbit_path.pop(0)
+            self._orbit_path.pop(0)
 
         # --- No path available, stop ---
         if not self._orbit_path:
@@ -547,27 +582,31 @@ class FSM:
     def _dribble(self, self_pose, ball_pos):
         print("DRIBBLE")
         ball_diff_dist, ball_diff_heading  = self._get_dist_heading_diff(self_pose, ball_pos)
-        goal_diff_dist, goal_diff_heading  = self._get_dist_heading_diff(self_pose, GOALS[0])
+        goal_diff_dist, goal_diff_heading  = self._get_dist_heading_diff(self_pose, GOAL_MORE)
 
         # Weight how much to care about each:
         # — ball_diff_heading: keep ball centered in front of you (tight control)
         # — goal_diff_heading: steer toward goal (looser, longer range)
-        K_ball = 1.75   # how aggressively to keep ball centered
+        K_ball = 1.8   # how aggressively to keep ball centered
         K_goal = 1.4   # how aggressively to steer toward goal
 
-        goal_ball_heading = goal_diff_heading - ball_diff_heading # see how far off the angles are from one another
+        goal_ball_heading = goal_diff_heading - ball_diff_heading  # see how far off the angles are from one another
 
+        print(f"ball_diff_heading{ball_diff_heading:.3f} | goal_ball_heading{goal_ball_heading:.3f}")
         # Blend the two errors — ball centering dominates, goal heading assists
         steering = K_ball * ball_diff_heading + K_goal * goal_ball_heading
 
         # Scale forward speed down if steering correction is large
-        forward = 6.25 * max(0.4, 1.0 - abs(steering) / math.pi)
+        forward = 6.25 * max(0.4, 1.0 - abs(steering) / math.pi) # when little steering, then max(0.4, 1) = 1, when much steering, max(0.4, 0) = .4
 
         left  = max(-6.25, min(6.25, forward - steering))
         right = max(-6.25, min(6.25, forward + steering))
 
         print(f"DRIBBLE — ball_hdiff={math.degrees(ball_diff_heading):.1f}°  goal_hdiff={math.degrees(goal_diff_heading):.1f}°  steering={math.degrees(steering):.1f}°")
         return {"left_motor": left, "right_motor": right}
+    
+
+    
     def _intercept(self, pose, opponent_pos):
         print("INTERCEPT") 
         return {"left_motor": 0, "right_motor": 6.25}
@@ -687,7 +726,7 @@ class Visualizer:
             ax_pt, ay_pt, _ = fsm._get_approach_pose(last_ball)
             self._approach_sc.set_offsets([[ax_pt, ay_pt]])
             # Dashed line from ball to target goal showing intended shot
-            gx, gy = GOALS[0]
+            gx, gy = GOAL_MORE
             self._shot_line.set_data([last_ball[0], gx], [last_ball[1], gy])
         else:
             self._approach_sc.set_offsets(np.empty((0, 2)))
