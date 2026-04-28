@@ -229,13 +229,14 @@ class ParticleFilter:
 # Step 2-6: FSM and actions
 # ---------------------------------------------------------------------------
 class State(Enum):
+    GET_OFF_WALL = auto()
     SEARCH       = auto()
     TOWARDS_BALL = auto()
     ORBIT        = auto()
     ALIGN        = auto()
     DRIBBLE      = auto()
     INTERCEPT    = auto()
-    GET_OFF_WALL = auto()
+    
 
 class FSM:
     def __init__(self):
@@ -243,6 +244,7 @@ class FSM:
         self._ball_close_threshold = .5
         
         self._wall_safety = (4.9, 3.5) # 4.9 max goal to goal, and 3.5 is max for other way
+        self._last_20_poses = []
 
         # --- Below are some states variables for different actions ---
         # Search
@@ -267,6 +269,10 @@ class FSM:
 
 
     def control(self, self_pose, ball_seen, last_ball, last_opponent):
+        self._last_20_poses.append(self_pose)
+        if len(self._last_20_poses) > 20:
+            self._last_20_poses.pop(0)
+        
         self._update_state(self_pose, ball_seen, last_ball, last_opponent) # update what state currently in
         return self._execute_action(self_pose, last_ball, last_opponent) # then perform an action
 
