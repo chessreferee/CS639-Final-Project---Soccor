@@ -267,6 +267,10 @@ class FSM:
         self._dribble_dist_threshold = .067 # distance to start dribbling
         self._dribble_heading_threshold = math.pi / 18 # plus or minus this amount for it to be good to be kicked.
 
+        # Corner Case
+        self._cc_in_region = False
+        self._cc_steps_out_count = 0
+        self._cc_steps_out_max = 100 # number of steps to be out of corner case to return back to normal
 
     def control(self, self_pose, ball_seen, last_ball, last_opponent):
         self._last_50_poses.append(self_pose)
