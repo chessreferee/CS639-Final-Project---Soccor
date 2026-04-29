@@ -31,7 +31,7 @@ CENTER  = [(0.0, 0.0)]
 GOAL_MORE = (4.67, 0.0) # just a little more to ensure ball is kicked in
 
 NUM_PARTICLES   = 150
-RESAMPLE_THRESH = 0.5
+RESAMPLE_THRESH = 0.7
 
 # Noise tuning
 OBS_DIST_STD = 0.15   # TODO: not too sure about these noise values
@@ -39,7 +39,7 @@ OBS_ANG_STD  = 0.05
 MOT_FWD_STD  = 0.02
 MOT_ROT_STD  = 0.01
 
-DRAW_EVERY = 20  # update plot every N steps
+DRAW_EVERY = 50  # update plot every N steps
 
 
 
@@ -241,10 +241,9 @@ class State(Enum):
 class FSM:
     def __init__(self):
         self._state = State.SEARCH # initially always trying to look for ball
-        self._ball_close_threshold = .5
         
         self._wall_safety = (4.9, 3.5) # 4.9 max goal to goal, and 3.5 is max for other way
-        self._last_50_poses = []
+        
 
         # --- Below are some states variables for different actions ---
         # Search
@@ -267,18 +266,116 @@ class FSM:
         self._dribble_dist_threshold = .067 # distance to start dribbling
         self._dribble_heading_threshold = math.pi / 18 # plus or minus this amount for it to be good to be kicked.
 
-        # Corner Case
+
+        # Corner CASES
+        # If at corner
         self._cc_in_region = False
         self._cc_steps_out_count = 0
         self._cc_steps_out_max = 100 # number of steps to be out of corner case to return back to normal
+        # if stuck against wall
+        self._against_wall = False
+        self._last_poses = []
+        self._back_up_count = 0
+        self._back_up_max = 100
 
     def control(self, self_pose, ball_seen, last_ball, last_opponent):
-        self._last_50_poses.append(self_pose)
-        if len(self._last_50_poses) > 50:
-            self._last_50_poses.pop(0) #TODO: work on moving backwards if stuck on wall, may need to have something in particle filter that will let particle filter know of backward movement
+        # Below is for checking if stuck against wall
+        self._last_poses.append(self_pose)
+        if len(self._last_poses) > 300: # max has last 300 poses
+            self._last_poses.pop(0) #TODO: work on moving backwards if stuck on wall, may need to have something in particle filter that will let particle filter know of backward movement
         
+        
+        # if against wall, then increment the back_up_count. If not against wall, check if it is
+        if self._against_wall:
+            self._back_up_count += 1
+            if self._back_up_count >= self._back_up_max:
+                # gone back self._back_up_max steps, so now reset everything
+                self._against_wall = False
+                self._last_poses = []
+                self._back_up_count = 0
+        else:
+            # self._against_wall = False currently
+            # Check if should turn this into true
+            self._against_wall = self._is_stuck()
+
+        # --- Corner case tracking ---
+        currently_in_corner = self._check_corner_case(self_pose)
+        if currently_in_corner:
+            self._cc_in_region = True
+            self._cc_steps_out_count = 0  # reset counter whenever still in corner
+        elif self._cc_in_region:
+            self._cc_steps_out_count += 1
+            if self._cc_steps_out_count >= self._cc_steps_out_max:
+                self._cc_in_region = False  # fully exited corner case
+                self._cc_steps_out_count = 0
+
         self._update_state(self_pose, ball_seen, last_ball, last_opponent) # update what state currently in
         return self._execute_action(self_pose, last_ball, last_opponent) # then perform an action
+
+    # Below is For Corner Cases
+    def _check_corner_case(self, self_pose):
+        """
+        Check if at the enemy side corners, then should first try to go to CROSS in front of enemy goal first
+        """
+
+        x, y, _ = self_pose
+
+        L = 2.2
+
+        # --- Top-right corner (4.5, 3.0) ---
+        cx, cy = 4.5, 3.0
+        dx = cx - x   # distance inward from right wall
+        dy = cy - y   # distance downward from top wall
+
+        if 0 <= dx <= L and 0 <= dy <= L: # first makes sure near the corner in the bounds
+            if dx + dy <= L: # draws a line where the corner is the origin. (a simple y = L - x equation)
+                return True
+
+        # --- Bottom-right corner (4.5, -3.0) ---
+        cx, cy = 4.5, -3.0
+        dx = cx - x
+        dy = y - cy   # upward from bottom wall
+
+        if 0 <= dx <= L and 0 <= dy <= L:
+            if dx + dy <= L:
+                return True
+
+        return False
+
+    def _is_stuck(self):
+        poses = self._last_poses
+        if len(poses) < 150: # need to have atleast the past 150 poses
+            return False
+
+        x0, y0, h0 = poses[0]
+        x1, y1, h1 = poses[-1]
+
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.sqrt(dx**2 + dy**2)
+
+        dtheta = (h1 - h0 + math.pi) % (2 * math.pi) - math.pi
+
+        spread = self._position_spread()
+        print(dist, spread, dtheta)
+
+        return (
+            dist < 0.05 and              # not going anywhere
+            spread < 0.5 and            # not even jittering far
+            abs(dtheta) < math.radians(10)
+        )
+    
+    def _position_spread(self):
+        xs = [p[0] for p in self._last_poses]
+        ys = [p[1] for p in self._last_poses]
+
+        return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+    def _get_target_goal(self):
+        """Returns the goal to aim for based on corner case state."""
+        if self._cc_in_region:
+            return (3.25, 0.0)  # penalty cross — intermediate target to escape corner
+        return GOAL_MORE
 
     def _update_state(self, self_pose, ball_seen, last_ball, last_opponent):
         if last_ball is not None:
@@ -312,11 +409,14 @@ class FSM:
             print(f"ORBIT: dist_robot_ball={dist_robot_ball:.2f}")
             if dist_ok and heading_ok:
                 self._state = State.DRIBBLE
+                self._orbit_path = []
             elif dist_robot_ball > self._orbit_radius * self._orbit_pull:
                     # if fall out of orbit, then need to go back towards ball
                     self._state = State.TOWARDS_BALL
+                    self._orbit_path = []
             elif dist_ok:
                 self._state = State.ALIGN
+                self._orbit_path = []
 
         elif self._state == State.ALIGN:
             if not ball_seen:
@@ -359,7 +459,7 @@ class FSM:
         if offset is None:
             offset=self._orbit_radius
 
-        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, offset)
+        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, offset, goal=self._get_target_goal())
         
         dist, _ = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
         heading_err = (desired_heading - self_pose[2] + math.pi) % (2 * math.pi) - math.pi
@@ -384,6 +484,10 @@ class FSM:
         return dist, heading_diff
 
     def _execute_action(self, self_pose, last_ball, last_opponent):
+        if self._against_wall:
+            print("AGAINST WALL")
+            return {"left_motor": -6.25, "right_motor": -6.25}
+
         if self._state == State.SEARCH:
             return self._search(self_pose, last_ball)
         elif self._state == State.TOWARDS_BALL:
@@ -425,7 +529,7 @@ class FSM:
 
     def _towards_ball(self, self_pose, ball_pos, last_opponent):
         print("TOWARDS_BALL")
-        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius)
+        approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius, goal=self._get_target_goal())
 
         dist_to_approach, heading_to_approach = self._get_dist_heading_diff(
             self_pose, (approach_x, approach_y)
@@ -474,35 +578,7 @@ class FSM:
 
         return (ax, ay, desired_heading)
 
-    # TODO add check for corner case and maybe have 100 steps once you leave corner case to keep on going to the Cross
-    def _check_corner_case(self, self_pose):
-        """
-        Check if at the enemy side corners, then should first try to go to CROSS in front of enemy goal first
-        """
 
-        x, y, _ = self_pose
-
-        L = 2.2
-
-        # --- Top-right corner (4.5, 3.0) ---
-        cx, cy = 4.5, 3.0
-        dx = cx - x   # distance inward from right wall
-        dy = cy - y   # distance downward from top wall
-
-        if 0 <= dx <= L and 0 <= dy <= L: # first makes sure near the corner in the bounds
-            if dx + dy <= L: # draws a line where the corner is the origin. (a simple y = L - x equation)
-                return True
-
-        # --- Bottom-right corner (4.5, -3.0) ---
-        cx, cy = 4.5, -3.0
-        dx = cx - x
-        dy = y - cy   # upward from bottom wall
-
-        if 0 <= dx <= L and 0 <= dy <= L:
-            if dx + dy <= L:
-                return True
-
-        return False
 
     def _orbit(self, self_pose, ball_pos, last_opponent):
         """
@@ -510,7 +586,7 @@ class FSM:
         """
 
         print("ORBIT")
-        approach_x, approach_y, _ = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius)
+        approach_x, approach_y, _ = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius, goal=self._get_target_goal())
         bx, by  = ball_pos
         x, y, _ = self_pose
 
@@ -529,7 +605,7 @@ class FSM:
             # Figure out shortest arc direction (CW or CCW)
             angle_diff = (end_angle - start_angle + math.pi) % (2 * math.pi) - math.pi
 
-            # Generate 10 waypoints along the arc
+            # Generate waypoints along arc
             num_points = 10
             self._orbit_path = []
             for i in range(1, num_points + 1):
@@ -541,6 +617,8 @@ class FSM:
 
             # skip first 2 waypoints as they are not needed as you can just do waypoints 3-10, which takes a more direct path to the approach pose
             # This also helps with dribble as if a waypoint is behind itself, it often turns the wrong way, making dribble quite slow
+            self._orbit_path.pop(0)
+            self._orbit_path.pop(0)
             self._orbit_path.pop(0)
             self._orbit_path.pop(0)
 
@@ -577,7 +655,7 @@ class FSM:
         """
         Once you orbit to correct position, you align yourself to the ball
         """
-        _, __, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent)
+        _, __, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, goal=self._get_target_goal())
         heading_err = (desired_heading - self_pose[2] + math.pi) % (2 * math.pi) - math.pi
         turn_speed  = 6.25 if heading_err > 0 else -6.25
         print(f"ALIGN — heading_err={math.degrees(heading_err):.1f}°")
@@ -727,10 +805,10 @@ class Visualizer:
 
         # Shot line + approach point — draw when we have a ball position
         if last_ball is not None:
-            ax_pt, ay_pt, _ = fsm._get_approach_pose(last_ball)
+            ax_pt, ay_pt, _ = fsm._get_approach_pose(last_ball, goal=fsm._get_target_goal())
             self._approach_sc.set_offsets([[ax_pt, ay_pt]])
-            # Dashed line from ball to target goal showing intended shot
-            gx, gy = GOAL_MORE
+            # Dashed line from ball to current target goal (changes when in corner case)
+            gx, gy = fsm._get_target_goal()
             self._shot_line.set_data([last_ball[0], gx], [last_ball[1], gy])
         else:
             self._approach_sc.set_offsets(np.empty((0, 2)))
@@ -761,12 +839,14 @@ class Visualizer:
         sx, sy  = pf.std()
         ess     = 1.0 / np.sum(pf.weights**2)
         opp_str = f"  opp_last=({last_opponent[0]:.2f}, {last_opponent[1]:.2f})" if last_opponent else ""
+        cc_str  = f"  CC({fsm._cc_steps_out_count}/{fsm._cc_steps_out_max})" if fsm._cc_in_region else ""
         self._info_text.set_text(
             f"pos=({est_x:.2f}, {est_y:.2f})  "
             f"heading={math.degrees(est_heading):.1f}°  "
             f"std=({sx:.3f}, {sy:.3f})  "
             f"ESS={ess:.0f}/{pf.n}  "
             f"state={fsm._state.name}"
+            f"{cc_str}"
             f"{opp_str}"
         )
 
