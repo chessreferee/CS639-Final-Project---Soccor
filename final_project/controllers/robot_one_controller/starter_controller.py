@@ -28,7 +28,7 @@ CORNERS = [(-4.5, 3.0), (-4.5, -3.0), (4.5, 3.0), (4.5, -3.0)]
 CROSSES = [(3.25, 0.0), (-3.25, 0.0)]
 CENTER  = [(0.0, 0.0)]
 
-GOAL_MORE = (4.67, 0.0) # just a little more to ensure ball is kicked in
+GOAL_MORE = (4.8, 0.0) # just a little more to ensure ball is kicked in
 
 NUM_PARTICLES   = 150
 RESAMPLE_THRESH = 0.7
@@ -229,7 +229,6 @@ class ParticleFilter:
 # Step 2-6: FSM and actions
 # ---------------------------------------------------------------------------
 class State(Enum):
-    GET_OFF_WALL = auto()
     SEARCH       = auto()
     TOWARDS_BALL = auto()
     ORBIT        = auto()
@@ -256,11 +255,12 @@ class FSM:
         self._search_turn_direction = None 
         self._search_centered_threshold = math.pi / 6 # how centered needed to be for a search
 
-        # Towards Ball
-        self._orbit_radius = .3
+        # Orbit
+        self._orbit_radius = .35
         self._orbit_threshold = 1 # distance to start orbitting around
         self._orbit_pull = 1.75 # once enter orbit, multiplier to get out
-        self._orbit_path = None # path to goal position
+        self._orbit_path = None # path to goal position\
+        self._orbit_close_approach_threshold = .12
 
         # Dribble
         self._dribble_dist_threshold = .067 # distance to start dribbling
@@ -617,10 +617,16 @@ class FSM:
 
             # skip first 2 waypoints as they are not needed as you can just do waypoints 3-10, which takes a more direct path to the approach pose
             # This also helps with dribble as if a waypoint is behind itself, it often turns the wrong way, making dribble quite slow
+            
             self._orbit_path.pop(0)
             self._orbit_path.pop(0)
-            self._orbit_path.pop(0)
-            self._orbit_path.pop(0)
+
+            # if somewhat close to approach, the pop more out
+            self_approach_dist, _ = self._get_dist_heading_diff(self_pose, (approach_x, approach_y))
+            if self_approach_dist < self._orbit_close_approach_threshold:
+                self._orbit_path.pop(0)
+                self._orbit_path.pop(0)
+                self._orbit_path.pop(0)
 
         # --- No path available, stop ---
         if not self._orbit_path:
