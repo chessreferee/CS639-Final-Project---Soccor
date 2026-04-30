@@ -31,7 +31,7 @@ CENTER  = [(0.0, 0.0)]
 GOAL_MORE = (4.8, 0.0) # just a little more to ensure ball is kicked in
 
 NUM_PARTICLES   = 150
-RESAMPLE_THRESH = 0.7
+RESAMPLE_THRESH = 0.5
 
 # Noise tuning
 OBS_DIST_STD = 0.15   # TODO: not too sure about these noise values
@@ -39,7 +39,7 @@ OBS_ANG_STD  = 0.05
 MOT_FWD_STD  = 0.02
 MOT_ROT_STD  = 0.01
 
-DRAW_EVERY = 50  # update plot every N steps
+DRAW_EVERY = 20  # update plot every N steps
 
 
 
@@ -52,10 +52,11 @@ class StudentController:
         self.pf             = ParticleFilter(init_x=-1.0, init_y=0.0, init_heading=0.0, n=NUM_PARTICLES)
         self.viz            = Visualizer()
         self.fsm            = FSM()
-        self._viz_show       = True
+        self._viz_show       = False
         self._step_count    = 0
         self._last_opponent = None  # (world_x, world_y) of last seen opponent
         self._last_ball     = None  # (world_x, world_y) of last seen ball
+        self._last_backwards = False # if went backwards the last step, then odometry will be negative for dist
 
     def step(self, sensors):
         # Step 1: Run particle filter
@@ -66,7 +67,11 @@ class StudentController:
             "penalty_cross": sensors.get("penalty_cross", []),
             "corners":       sensors.get("corners", []),
         }
-        self.pf.update(odometry, observations)
+        self.pf.update(odometry, observations, self._last_backwards)
+        
+        # reset the backwards
+        if self._last_backwards:
+            self._last_backwards = False
 
         x, y, heading = self.pf.estimate()
 
@@ -99,7 +104,13 @@ class StudentController:
         # print(self_pose)
         
         controls = self.fsm.control(self_pose, ball_seen, self._last_ball, self._last_opponent)
-        
+
+        # check if controls is backwards
+        if controls["left_motor"] < - 1 and controls["right_motor"] < -1:
+            # if both went back significant amount, then know we went backwards
+            self._last_backwards = True
+
+        # print(f"left_motor{controls["left_motor"]:.3f} | right_motor{controls["right_motor"]:.3f}")
         return controls
 
 # ---------------------------------------------------------------------------
@@ -121,8 +132,14 @@ class ParticleFilter:
         self.particles[:, 2] = np.random.normal(init_heading, 0.02, n)
         self.weights = np.ones(n) / n
 
-    def update(self, odometry, observations):
-        self._motion_update(odometry)
+        self._resample_count = 0
+
+    def update(self, odometry, observations, backwards=False):
+        if backwards:
+            # if moved backwards, then have negative odometry
+            self._motion_update(-odometry)
+        else:
+            self._motion_update(odometry)
         self._observation_update(observations)
         self._resample()
 
@@ -215,6 +232,9 @@ class ParticleFilter:
         if ess / self.n > RESAMPLE_THRESH:
             return
 
+        print(f"RESAMPLING: {self._resample_count}")
+        self._resample_count += 1
+
         positions = (np.arange(self.n) + np.random.uniform(0, 1)) / self.n
         cumsum    = np.cumsum(self.weights)
         indices   = np.searchsorted(cumsum, positions)
@@ -234,6 +254,7 @@ class State(Enum):
     ORBIT        = auto()
     ALIGN        = auto()
     DRIBBLE      = auto()
+    DRIBBLE_SURVEY = auto()
     INTERCEPT    = auto()
     
 
@@ -256,27 +277,31 @@ class FSM:
         self._search_centered_threshold = math.pi / 6 # how centered needed to be for a search
 
         # Orbit
-        self._orbit_radius = .35
+        self._orbit_radius = .31
         self._orbit_threshold = 1 # distance to start orbitting around
         self._orbit_pull = 1.75 # once enter orbit, multiplier to get out
-        self._orbit_path = None # path to goal position\
-        self._orbit_close_approach_threshold = .12
+        self._orbit_path = None # path to goal position
+        self._orbit_close_approach_threshold = .2
 
         # Dribble
-        self._dribble_dist_threshold = .067 # distance to start dribbling
-        self._dribble_heading_threshold = math.pi / 18 # plus or minus this amount for it to be good to be kicked.
+        self._dribble_dist_threshold = .1 # distance to start dribbling
+        self._dribble_heading_threshold = math.pi / 12 # plus or minus this amount for it to be good to be kicked.
+
+        # Dribble_survey
+        self._survey_max_steps = 50
+        self._survey_step_count = 0
 
 
         # Corner CASES
         # If at corner
         self._cc_in_region = False
         self._cc_steps_out_count = 0
-        self._cc_steps_out_max = 100 # number of steps to be out of corner case to return back to normal
+        self._cc_steps_out_max = 150 # number of steps to be out of corner case to return back to normal
         # if stuck against wall
         self._against_wall = False
         self._last_poses = []
         self._back_up_count = 0
-        self._back_up_max = 100
+        self._back_up_max = 10
 
     def control(self, self_pose, ball_seen, last_ball, last_opponent):
         # Below is for checking if stuck against wall
@@ -339,10 +364,15 @@ class FSM:
         if 0 <= dx <= L and 0 <= dy <= L:
             if dx + dy <= L:
                 return True
+            
+        # check if just above 4.5 or just behind the goal
+        if x >= 4.5:
+            return True
 
         return False
 
     def _is_stuck(self):
+        
         poses = self._last_poses
         if len(poses) < 150: # need to have atleast the past 150 poses
             return False
@@ -357,11 +387,11 @@ class FSM:
         dtheta = (h1 - h0 + math.pi) % (2 * math.pi) - math.pi
 
         spread = self._position_spread()
-        print(dist, spread, dtheta)
+        # print(dist, spread, dtheta)
 
         return (
             dist < 0.05 and              # not going anywhere
-            spread < 0.5 and            # not even jittering far
+            spread < 0.3 and            # not even jittering far
             abs(dtheta) < math.radians(10)
         )
     
@@ -402,7 +432,6 @@ class FSM:
                     self._state = State.ALIGN
                 elif dist_robot_ball < self._orbit_radius: # within the orbit's pull
                     self._state = State.ORBIT  # close enough to start orbiting
-
         elif self._state == State.ORBIT:
             dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
             dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
@@ -419,33 +448,44 @@ class FSM:
                 self._orbit_path = []
 
         elif self._state == State.ALIGN:
-            if not ball_seen:
+            dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
+            dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
+            if dist_ok and heading_ok:
+                self._state = State.DRIBBLE
+            elif dist_robot_ball > self._orbit_radius * self._orbit_pull:
+                # if fall out of orbit, then need to go back towards ball
+                self._state = State.TOWARDS_BALL
+            elif not dist_ok and heading_ok:
+                self._state = State.ORBIT # need to turn more around circle to get to correct position
+            elif not ball_seen and not dist_ok:
+                # if ball is not seen and the far from approach, then should start SEARCH again
                 self._state = State.SEARCH
-            else:
-                dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent)
-                dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
-                if dist_ok and heading_ok:
-                    self._state = State.DRIBBLE
-                elif dist_robot_ball > self._orbit_radius * self._orbit_pull:
-                    # if fall out of orbit, then need to go back towards ball
-                    self._state = State.TOWARDS_BALL
-                elif not dist_ok and heading_ok:
-                    self._state = State.ORBIT # need to turn more around circle to get to correct position
                 
                 # if don't go through any, then dist_ok is fine, but heading is not right yet
 
         elif self._state == State.DRIBBLE:
             if not ball_seen:
-                self._state = State.SEARCH
+                self._state = State.DRIBBLE_SURVEY
             else:
                 dist_ok, heading_ok = self._robot_ball_dist_and_heading_checker(self_pose, last_ball, last_opponent, heading_mult= 1.5, offset = .21)
                 dist_robot_ball, _ = self._get_dist_heading_diff(self_pose, last_ball)
                 if dist_robot_ball > self._orbit_radius * self._orbit_pull:
                     # if fall out of orbit, then need to go back towards ball
                     self._state = State.TOWARDS_BALL
-                elif not heading_ok and dist_ok:
-                    # if heading is not good anymore, then Align
-                    self._state = State.ALIGN
+                elif not heading_ok:
+                    # if heading is not good anymore, then DRIBBLE_SURVEY to move back to get a better understanding of where to turn
+                    self._state = State.DRIBBLE_SURVEY
+        elif self._state == State.DRIBBLE_SURVEY:
+            self._survey_step_count += 1
+
+            # check if go back enough steps, if so, exit DRIBBLE_SURVEY
+            if self._survey_step_count > self._survey_max_steps:
+                if ball_seen:
+                    self._state = State.ORBIT # if ball is seen, then go back to ORBIT to get to a position to where I can DRIBBLE
+                else:
+                    # if ball is not seen, then SEARCH for ball
+                    self._state = State.SEARCH
+                self._survey_step_count = 0 # reset the survey_step_count
         elif self._state == State.INTERCEPT:
             if not ball_seen:
                 self._state = State.SEARCH # if ball is not seen
@@ -485,7 +525,7 @@ class FSM:
 
     def _execute_action(self, self_pose, last_ball, last_opponent):
         if self._against_wall:
-            print("AGAINST WALL")
+            # print("AGAINST WALL")
             return {"left_motor": -6.25, "right_motor": -6.25}
 
         if self._state == State.SEARCH:
@@ -494,6 +534,9 @@ class FSM:
             return self._towards_ball(self_pose, last_ball, last_opponent)
         elif self._state == State.DRIBBLE:
             return self._dribble(self_pose, last_ball)
+        elif self._state == State.DRIBBLE_SURVEY:
+            # print("DRIBBLE_SURVEY")
+            return {"left_motor": -6.25, "right_motor": -6.25} # just go backwards if DRIBBLE SURVEY
         elif self._state == State.ORBIT:
             return self._orbit(self_pose, last_ball, last_opponent)
         elif self._state == State.ALIGN:
@@ -502,7 +545,7 @@ class FSM:
             return self._intercept(self_pose, last_opponent)
 
     def _search(self, self_pose, last_ball): 
-        print("SEARCH")
+        # print("SEARCH")
 
         if self._search_turn_direction == None:
             # if haven't determined a direction, then determine a spin direction
@@ -528,7 +571,7 @@ class FSM:
             return {"left_motor": 6.25, "right_motor": -6.25}
 
     def _towards_ball(self, self_pose, ball_pos, last_opponent):
-        print("TOWARDS_BALL")
+        # print("TOWARDS_BALL")
         approach_x, approach_y, desired_heading = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius, goal=self._get_target_goal())
 
         dist_to_approach, heading_to_approach = self._get_dist_heading_diff(
@@ -541,7 +584,7 @@ class FSM:
         left    = max(-6.25, min(6.25, forward - K_turn * heading_to_approach))
         right   = max(-6.25, min(6.25, forward + K_turn * heading_to_approach))
 
-        print(f"TOWARDS_BALL — dist={dist_to_approach:.2f}  hdiff={math.degrees(heading_to_approach):.1f}°")
+        # print(f"TOWARDS_BALL — dist={dist_to_approach:.2f}  hdiff={math.degrees(heading_to_approach):.1f}°")
         return {"left_motor": left, "right_motor": right}
     
     def _get_approach_pose(self, ball_pos, self_pose=None, opponent_pos=None, offset=0.3, goal=GOAL_MORE):
@@ -578,15 +621,13 @@ class FSM:
 
         return (ax, ay, desired_heading)
 
-
-
     def _orbit(self, self_pose, ball_pos, last_opponent):
         """
         Once in orbit, breaks down 10 points that will lead to going to correct
         """
 
-        print("ORBIT")
-        approach_x, approach_y, _ = self._get_approach_pose(ball_pos, self_pose, last_opponent, self._orbit_radius, goal=self._get_target_goal())
+        # print("ORBIT")
+        approach_x, approach_y, _ = self._get_approach_pose(ball_pos, self_pose=self_pose, opponent_pos=last_opponent, offset=self._orbit_radius, goal=self._get_target_goal())
         bx, by  = ball_pos
         x, y, _ = self_pose
 
@@ -675,14 +716,12 @@ class FSM:
         # Weight how much to care about each:
         # — ball_diff_heading: keep ball centered in front of you (tight control)
         # — goal_diff_heading: steer toward goal (looser, longer range)
-        K_ball = 1.8   # how aggressively to keep ball centered
-        K_goal = 1.4   # how aggressively to steer toward goal
+        K_ball = 1.5   # how aggressively to keep ball centered
+        K_goal = 1.5   # how aggressively to steer toward goal
 
-        goal_ball_heading = goal_diff_heading - ball_diff_heading  # see how far off the angles are from one another
-
-        print(f"ball_diff_heading{ball_diff_heading:.3f} | goal_ball_heading{goal_ball_heading:.3f}")
+        print(f"ball_diff_heading{ball_diff_heading:.3f} | goal_diff_heading{goal_diff_heading:.3f}")
         # Blend the two errors — ball centering dominates, goal heading assists
-        steering = K_ball * ball_diff_heading + K_goal * goal_ball_heading
+        steering = K_ball * ball_diff_heading + K_goal * goal_diff_heading
 
         # Scale forward speed down if steering correction is large
         forward = 6.25 * max(0.4, 1.0 - abs(steering) / math.pi) # when little steering, then max(0.4, 1) = 1, when much steering, max(0.4, 0) = .4
